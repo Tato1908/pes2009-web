@@ -1,0 +1,72 @@
+# Compila PPSSPP a WebAssembly en la nube de GitHub y lo publica en GitHub Pages.
+# No incluye ningún juego: el ISO se carga desde tu PC con "Load Game".
+name: Build PPSSPP Web
+
+on:
+  workflow_dispatch:      # botón "Run workflow" en la pestaña Actions
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: emscripten/emsdk:5.0.7
+    steps:
+      - name: Descargar interfaz web (ppsspp-web)
+        uses: actions/checkout@v6
+        with:
+          repository: root-hunter/ppsspp-web
+          ref: wasm
+          path: upstream
+          fetch-depth: 1
+
+      - name: Descargar emulador (ppsspp-wasm)
+        uses: actions/checkout@v6
+        with:
+          repository: root-hunter/ppsspp-wasm
+          ref: wasm
+          path: ppsspp-wasm-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Preparar herramientas
+        run: |
+          git config --global --add safe.directory '*'
+          apt-get update
+          apt-get install -y --no-install-recommends ninja-build ca-certificates python3
+
+      - name: Compilar PPSSPP a WebAssembly (tarda bastante)
+        working-directory: upstream
+        run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
+
+      - name: Compilar la página
+        working-directory: upstream
+        run: |
+          npm --prefix wasm-page ci
+          make app-build-pages WASM_ROOT=../ppsspp-wasm-src
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: upstream/wasm-page/dist/ppsspp-web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
