@@ -55,6 +55,26 @@ jobs:
           npm --prefix wasm-page ci
           make app-build-pages WASM_ROOT=../ppsspp-wasm-src
 
+      - name: Armar paquete local con servidor multijugador
+        run: |
+          mkdir -p local/pes2009-local/wasm-page/dist local/pes2009-local/server
+          cp -a upstream/wasm-page/dist/ppsspp-web local/pes2009-local/wasm-page/dist/
+          cp upstream/server/serve.py local/pes2009-local/server/
+          printf '%s\r\n' \
+            '@echo off' \
+            'cd /d "%~dp0"' \
+            'echo Abre en el navegador: http://localhost:8081' \
+            'echo Para cerrar el servidor: Ctrl + C' \
+            'start "" http://localhost:8081' \
+            'where py >nul 2>nul && (py server\serve.py --bind 127.0.0.1 --port 8081 --web-root . --wasm-root wasm-page\dist\ppsspp-web --adhoc-ws) || (python server\serve.py --bind 127.0.0.1 --port 8081 --web-root . --wasm-root wasm-page\dist\ppsspp-web --adhoc-ws)' \
+            'pause' > local/pes2009-local/iniciar.bat
+
+      - name: Subir paquete local (descargable en la ejecución)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pes2009-local
+          path: local
+
       - uses: actions/configure-pages@v6
 
       - uses: actions/upload-pages-artifact@v5
