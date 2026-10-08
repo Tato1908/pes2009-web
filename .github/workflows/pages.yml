@@ -45,6 +45,22 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ninja-build ca-certificates python3
 
+      - name: Parche - DNS del multijugador en WebAssembly
+        # El getaddrinfo de Emscripten rechaza AI_ADDRCONFIG ("TODO" en su código) y
+        # PPSSPP no puede resolver el servidor ad-hoc ("DNS Error Resolving 127.0.0.1").
+        run: |
+          python3 - <<'EOF'
+          p = "ppsspp-wasm-src/Common/Net/Resolve.cpp"
+          s = open(p).read()
+          old = "\thints.ai_flags = /*AI_V4MAPPED |*/ AI_ADDRCONFIG;\n"
+          new = ("#ifdef __EMSCRIPTEN__\n"
+                 "\thints.ai_flags = 0;  // Emscripten getaddrinfo devuelve EAI_NONAME con AI_ADDRCONFIG\n"
+                 "#else\n" + old + "#endif\n")
+          assert s.count(old) == 1, "No se encontró la línea a parchear en Resolve.cpp"
+          open(p, "w").write(s.replace(old, new))
+          print("Parche DNS aplicado")
+          EOF
+
       - name: Compilar PPSSPP a WebAssembly (tarda bastante)
         working-directory: upstream
         run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
