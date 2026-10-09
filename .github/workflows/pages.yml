@@ -86,6 +86,45 @@ jobs:
           print("Parches de lobby aplicados")
           EOF
 
+      - name: Parche - reconexión del canal UDP y registro
+        # Si el WebSocket UDP de un jugador se cae, el puente original no reconecta y
+        # los paquetes quedan en cola para siempre (el rival "desaparece").
+        run: |
+          python3 - <<'EOF'
+          p = "upstream/wasm-page/public/ppsspp-runtime.js"
+          s = open(p).read()
+          old = ("    relay.ws.onclose = () => { relay.open = false; };\n"
+                 "    relay.ws.onerror = () => { relay.open = false; };\n"
+                 "    sock.__ppssppRelay = relay;\n")
+          new = ("    relay.ws.onclose = (ev) => {\n"
+                 "      relay.open = false;\n"
+                 "      log(\"Network: UDP relay closed port \" + sock.sport + \" code=\" + ev.code +\n"
+                 "          (relay.closedByGame ? \" (el juego cerro el socket)\" : \" - reconectando\"), relay.closedByGame ? \"\" : \"warn\");\n"
+                 "      if (relay.closedByGame || sock.__ppssppClosed || sock.__ppssppRelay !== relay) return;\n"
+                 "      sock.__ppssppRelay = null;\n"
+                 "      setTimeout(() => {\n"
+                 "        if (sock.__ppssppClosed || sock.__ppssppRelay) return;\n"
+                 "        openRelay(sock);\n"
+                 "        if (sock.__ppssppRelay) sock.__ppssppRelay.queue.push(...relay.queue);\n"
+                 "      }, 250);\n"
+                 "    };\n"
+                 "    relay.ws.onerror = () => { relay.open = false; };\n"
+                 "    sock.__ppssppRelay = relay;\n"
+                 "    log(\"Network: UDP relay open port \" + sock.sport);\n")
+          assert s.count(old) == 1, "No se encontró el onclose del relay UDP"
+          s = s.replace(old, new)
+          old = ("    if (sock.__ppssppRelay) {\n"
+                 "      try { sock.__ppssppRelay.ws.close(); } catch(e) {}\n")
+          new = ("    sock.__ppssppClosed = true;\n"
+                 "    if (sock.__ppssppRelay) {\n"
+                 "      sock.__ppssppRelay.closedByGame = true;\n"
+                 "      try { sock.__ppssppRelay.ws.close(); } catch(e) {}\n")
+          assert s.count(old) == 1, "No se encontró ops.close"
+          s = s.replace(old, new)
+          open(p, "w").write(s)
+          print("Parche de reconexion UDP aplicado")
+          EOF
+
       - name: Compilar PPSSPP a WebAssembly (tarda bastante)
         working-directory: upstream
         run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
