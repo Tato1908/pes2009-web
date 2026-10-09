@@ -446,6 +446,90 @@ jobs:
           print("Parche P2P (senalizacion) en el servidor aplicado")
           EOF
 
+      - name: Parche - arranque directo de PES 2009 (sin cargar el ISO cada vez)
+        run: |
+          python3 - <<'EOF'
+          p = "upstream/wasm-page/public/ppsspp-runtime.js"
+          s = open(p).read()
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, "ppsspp-runtime.js (autostart): no se encontro: " + old[:70]
+              s = s.replace(old, new)
+
+          # 1) Al elegir el ISO por primera vez: arrancar de una (la eleccion ya es un clic del usuario)
+          rep('''  updateIdleOverlay();
+            setStatus(selectedGame ? "Selected: " + selectedGame.name : "Ready. Open a game file or use Library.");
+          });''', '''  updateIdleOverlay();
+            setStatus(selectedGame ? "Selected: " + selectedGame.name : "Ready. Open a game file or use Library.");
+            if (selectedGame && !started) {
+              log("PES2009: ISO elegido, se guarda en este navegador y arranca directo.", "ok");
+              start();
+            }
+          });''')
+
+          # 2) Al abrir la pagina: si ya hay un PES guardado, dejarlo listo y el boton grande dice "Jugar PES 2009"
+          rep('''/* ── PWA: Service Worker registration ──────────────────────────── */''', '''/* ── pes2009-web: arranque directo de PES 2009 (como optijuegos) ── */
+          async function pesAutoSelect() {
+            if (started || selectedGame || selectedStoredGame) return;
+            let games = [];
+            try { games = (await opfsWalk(OPFS_GAMES_DIR, "", false)).map(g => g.path); } catch(e) {}
+            const pick = games.find(n => /pes|2009|ULUS10388|evolution/i.test(n)) || (games.length === 1 ? games[0] : null);
+            const kicker = document.querySelector("#idleOverlay .idle-kicker");
+            const title = document.querySelector("#idleOverlay .idle-title");
+            if (kicker) kicker.textContent = "PES 2009 Web";
+            if (pick) {
+              selectedStoredGame = pick;
+              log("PES2009: juego guardado encontrado (" + pick + "), listo para jugar.", "ok");
+              if (title) title.textContent = "Listo para jugar.";
+              if (idleSubtitle) idleSubtitle.textContent = "PES 2009 ya esta guardado en este navegador. Pulsa Jugar.";
+              if (idleStartBtn) idleStartBtn.innerHTML = "<span>\\u25B6 Jugar PES 2009</span>";
+            } else {
+              if (title) title.textContent = "Primera vez aqui.";
+              if (idleSubtitle) idleSubtitle.textContent = "Elige tu ISO de PES 2009 con \\"Open Game\\" (solo esta vez). " +
+                "Queda guardado en este navegador y la proxima vez arranca directo con un clic.";
+            }
+          }
+          pesAutoSelect();
+
+          /* ── PWA: Service Worker registration ──────────────────────────── */''')
+          open(p, "w").write(s)
+          print("Parche de arranque directo aplicado")
+          EOF
+
+      - name: Parche - juego desde el servidor (carpeta juego/, descarga unica)
+        run: |
+          python3 - <<'EOF'
+          import sys
+          p = "upstream/wasm-page/public/ppsspp-runtime.js"
+          s = open(p).read()
+          def rep(old, new, f="ppsspp-runtime.js"):
+              global s
+              assert s.count(old) == 1, f + " (juego servidor): no se encontro: " + old[:70]
+              s = s.replace(old, new)
+          JUEGO_JS = '/* ── pes2009-web: juego servido desde el servidor (carpeta juego/) ──\n   Si existe juego/juego.json, la pagina descarga ese juego una sola vez, lo guarda en el\n   navegador (OPFS) y deja el boton listo para jugar. Sin juego.json se usa el flujo normal. */\nlet juegoDescargando = false;\nfunction juegoTexto(titulo, subtitulo, boton) {\n  const kicker = document.querySelector("#idleOverlay .idle-kicker");\n  const title = document.querySelector("#idleOverlay .idle-title");\n  if (kicker && juegoTexto.nombre) kicker.textContent = juegoTexto.nombre;\n  if (title && titulo != null) title.textContent = titulo;\n  if (idleSubtitle && subtitulo != null) idleSubtitle.textContent = subtitulo;\n  if (idleStartBtn && boton != null) idleStartBtn.innerHTML = "<span>" + boton + "</span>";\n}\nfunction juegoMB(n) { return (n / 1048576).toFixed(0) + " MB"; }\nasync function juegoServidor() {\n  let cfg;\n  try {\n    const r = await fetch("juego/juego.json?t=" + Date.now(), { cache: "no-store" });\n    if (!r.ok) return false;\n    cfg = await r.json();\n  } catch(e) { return false; }\n  if (!cfg || !cfg.archivo) return false;\n  const url = new URL("juego/" + cfg.archivo, location.href).href;\n  const nombre = cfg.nombre || prettyGameName(cfg.archivo);\n  const safe = String(cfg.archivo).split("/").pop().replace(/[^a-zA-Z0-9._-]/g, "_");\n  juegoTexto.nombre = nombre;\n  try { await navigator.storage?.persist?.(); } catch(e) {}\n\n  // tamano en el servidor (para saber si la copia guardada esta completa y al dia)\n  let total = 0;\n  try {\n    const h = await fetch(url, { method: "HEAD", cache: "no-store" });\n    if (!h.ok) throw new Error("HTTP " + h.status);\n    total = parseInt(h.headers.get("content-length") || "0", 10) || 0;\n  } catch(e) {\n    log("Juego del servidor: no se encontro " + url + " (" + e.message + ")", "warn");\n    juegoTexto("No se encontro el juego.", "El servidor tiene juego/juego.json pero falta el archivo \\"" + cfg.archivo + "\\".", null);\n    return true;\n  }\n  let guardado = 0;\n  try { guardado = (await opfsGetGameFile(safe)).size; } catch(e) {}\n  if (!guardado || (total && guardado !== total)) {\n    juegoDescargando = true;\n    if (idleStartBtn) idleStartBtn.disabled = true;\n    juegoTexto("Descargando " + nombre + "...", "Solo la primera vez. Queda guardado en este navegador.", "Descargando...");\n    let w = null;\n    try {\n      const { dir, name } = await opfsParent(safe, true, OPFS_GAMES_DIR);\n      w = await (await dir.getFileHandle(name, { create: true })).createWritable();\n      const res = await fetch(url, { cache: "no-store" });\n      if (!res.ok || !res.body) throw new Error("HTTP " + res.status);\n      const reader = res.body.getReader();\n      let bajado = 0, ultimo = 0;\n      for (;;) {\n        const { done, value } = await reader.read();\n        if (done) break;\n        await w.write(value);\n        bajado += value.byteLength;\n        const now = performance.now();\n        if (now - ultimo > 250) {\n          ultimo = now;\n          const txt = total ? Math.floor(bajado * 100 / total) + "%  (" + juegoMB(bajado) + " de " + juegoMB(total) + ")" : juegoMB(bajado);\n          juegoTexto(null, "Descargando: " + txt + ". Solo la primera vez.", null);\n          if (stageMiniTextEl) stageMiniTextEl.textContent = "Descargando " + nombre + ": " + txt;\n          if (statusEl) statusEl.textContent = "Descargando " + nombre + ": " + txt;\n        }\n      }\n      await w.close();\n      w = null;\n      if (total && bajado !== total) throw new Error("descarga incompleta (" + bajado + " de " + total + " bytes)");\n      setPreloadFavorite(safe, true);\n      log("Juego del servidor guardado en el navegador: " + safe + " (" + juegoMB(bajado) + ")", "ok");\n      refreshLibrary();\n      updateStorageInfo();\n    } catch(e) {\n      juegoDescargando = false;\n      if (idleStartBtn) idleStartBtn.disabled = false;\n      try { if (w) await w.abort(); } catch(_) {}\n      try { await opfsDeleteGame(safe); } catch(_) {}\n      log("Juego del servidor: fallo la descarga: " + e.message, "err");\n      juegoTexto("No se pudo descargar.", "Error: " + e.message + ". Recarga la pagina para reintentar.", "Reintentar");\n      if (idleStartBtn) idleStartBtn.onclick = () => location.reload();\n      return true;\n    }\n    juegoDescargando = false;\n    if (idleStartBtn) idleStartBtn.disabled = false;\n  }\n  if (started) return true;\n  selectedGame = null;\n  selectedStoredGame = safe;\n  setStatus("Listo: " + nombre, "ok");\n  juegoTexto("Listo para jugar.", nombre + " esta guardado en este navegador.", "▶ Jugar");\n  return true;\n}\njuegoServidor().then(usado => { if (!usado) pesAutoSelect(); });\n\n'
+          rep("pesAutoSelect();\n\n/* \u2500\u2500 PWA", JUEGO_JS + "/* \u2500\u2500 PWA")
+          rep("async function start() {\n  if (started) return;\n",
+              "async function start() {\n  if (started) return;\n"
+              "  if (juegoDescargando) { setStatus(\"Espera a que termine la descarga del juego\", \"warn\"); return; }\n")
+          open(p, "w").write(s)
+
+          p = "upstream/wasm-page/public/sw.js"
+          s = open(p).read()
+          rep("  const pathname = url.pathname;\n",
+              "  const pathname = url.pathname;\n"
+              "  if (pathname.includes(\"/juego/\")) return;   // pes2009-web: el juego y su juego.json nunca se cachean aqui\n", "sw.js")
+          open(p, "w").write(s)
+
+          p = "upstream/server/serve.py"
+          s = open(p).read()
+          rep('        if request_path.startswith(("/wasm-page/", "/server/")):\n',
+              '        if request_path.startswith("/juego/"):\n'
+              '            return self._translate_under(self.web_root, request_path)\n'
+              '        if request_path.startswith(("/wasm-page/", "/server/")):\n', "serve.py")
+          open(p, "w").write(s)
+          print("Parche de juego desde el servidor aplicado")
+          EOF
+
       - name: Compilar PPSSPP a WebAssembly (tarda bastante)
         working-directory: upstream
         run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
@@ -461,6 +545,19 @@ jobs:
           mkdir -p local/pes2009-local/wasm-page/dist local/pes2009-local/server
           cp -a upstream/wasm-page/dist/ppsspp-web local/pes2009-local/wasm-page/dist/
           cp upstream/server/serve.py local/pes2009-local/server/
+          mkdir -p local/pes2009-local/juego
+          printf '%s\r\n' \
+            'JUEGO DESDE EL SERVIDOR' \
+            '' \
+            'Pon aqui un juego de PSP que tengas derecho a distribuir (homebrew libre, tu propio juego, etc.)' \
+            'y crea juego.json (copia juego.json.ejemplo) con el nombre del archivo.' \
+            '' \
+            'Al abrir la pagina, cada jugador lo descarga UNA sola vez; queda guardado en su navegador' \
+            'y desde ahi arranca con un clic en Jugar.' \
+            '' \
+            'Si no hay juego.json, la pagina funciona como antes: cada uno elige su propio archivo.' \
+            'Si cambias el archivo por otro de distinto tamano, los navegadores lo vuelven a descargar.' > local/pes2009-local/juego/LEEME.txt
+          printf '%s\n' '{' '  "nombre": "Mi juego",' '  "archivo": "mi-juego.iso"' '}' > local/pes2009-local/juego/juego.json.ejemplo
           printf '%s\r\n' \
             '@echo off' \
             'cd /d "%~dp0"' \
