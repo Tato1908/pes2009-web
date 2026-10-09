@@ -260,6 +260,67 @@ jobs:
           print("Parche de servidor aplicado")
           EOF
 
+      - name: Parche - servidor de salas externo (?relay=, modo online con tunel)
+        run: |
+          python3 - <<'EOF'
+          p = "upstream/wasm-page/public/ppsspp-runtime.js"
+          s = open(p).read()
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, "ppsspp-runtime.js: no se encontro: " + old[:70]
+              s = s.replace(old, new)
+
+          rep("const ADHOC_WS_PORT      = 27312;\n",
+          """const ADHOC_WS_PORT      = 27312;
+          // pes2009-web: servidor de salas externo indicado en el link (?relay=host o ?relay=wss://host:puerto)
+          const RELAY_OVERRIDE_KEY = "pes2009.relay";
+          (function captureRelayOverride() {
+            try {
+              const v = new URLSearchParams(location.search).get("relay");
+              if (v) sessionStorage.setItem(RELAY_OVERRIDE_KEY, v.trim());
+            } catch(e) {}
+          })();
+          function relayOverrideBase() {
+            let v = "";
+            try {
+              v = new URLSearchParams(location.search).get("relay") || sessionStorage.getItem(RELAY_OVERRIDE_KEY) || "";
+            } catch(e) {}
+            v = v.trim().replace(/\\/+$/, "");
+            if (!v) return "";
+            if (/^wss?:\\/\\//i.test(v)) return v;
+            if (/^https?:\\/\\//i.test(v)) return v.replace(/^http/i, "ws");
+            return "wss://" + v;
+          }
+          """)
+
+          rep("""  const query = new URLSearchParams(params);
+            return `${scheme}://${cfg.server}:${ADHOC_WS_PORT}${path}?${query.toString()}`;
+          """, """  const query = new URLSearchParams(params);
+            const relayBase = relayOverrideBase();
+            if (relayBase) return `${relayBase}${path}?${query.toString()}`;
+            return `${scheme}://${cfg.server}:${ADHOC_WS_PORT}${path}?${query.toString()}`;
+          """)
+
+          rep("""    let nextUrl = String(url);
+              if (location.protocol === "https:" && nextUrl.startsWith("ws://")) {
+          """, """    let nextUrl = String(url);
+              const relayBase = relayOverrideBase();
+              if (relayBase) {
+                try {
+                  const parsed = new URL(nextUrl);
+                  if (parsed.port === String(ADHOC_WS_PORT)) nextUrl = relayBase + parsed.pathname + parsed.search;
+                } catch(e) {}
+              }
+              if (location.protocol === "https:" && nextUrl.startsWith("ws://")) {
+          """)
+
+          rep("""  const base = `${scheme}://${relayHost}:${ADHOC_WS_PORT}`;
+          """, """  const base = relayOverrideBase() || `${scheme}://${relayHost}:${ADHOC_WS_PORT}`;
+          """)
+          open(p, "w").write(s)
+          print("Parche de servidor externo (?relay=) aplicado")
+          EOF
+
       - name: Compilar PPSSPP a WebAssembly (tarda bastante)
         working-directory: upstream
         run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
@@ -283,6 +344,18 @@ jobs:
             'start "" http://localhost:8081' \
             'where py >nul 2>nul && (py server\serve.py --bind 127.0.0.1 --port 8081 --web-root . --wasm-root wasm-page\dist\ppsspp-web --adhoc-ws) || (python server\serve.py --bind 127.0.0.1 --port 8081 --web-root . --wasm-root wasm-page\dist\ppsspp-web --adhoc-ws)' \
             'pause' > local/pes2009-local/iniciar.bat
+          OWNER="$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+          PAGINA="https://${OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+          echo "Pagina publica: $PAGINA"
+          PAGINA="$PAGINA" python3 - <<'EOF'
+          import os
+          ps1 = 'param(\n  [string]$Cloudflared = "",\n  [string]$Python = "",\n  [switch]$NoBrowser,\n  [switch]$NoWait\n)\n# PES 2009 Web - modo online: servidor de salas en este PC + tunel gratis de Cloudflare.\n$ErrorActionPreference = "Stop"\n$Pagina = "__PAGINA__"\nSet-Location -LiteralPath $PSScriptRoot\n\nWrite-Host ""\nWrite-Host "=== PES 2009 Web - modo online ===" -ForegroundColor Cyan\n\nif (-not $Cloudflared) {\n  $Cloudflared = Join-Path $PSScriptRoot "cloudflared.exe"\n  if (-not (Test-Path -LiteralPath $Cloudflared)) {\n    Write-Host "Descargando cloudflared (solo la primera vez)..."\n    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\n    $ProgressPreference = "SilentlyContinue"\n    Invoke-WebRequest -UseBasicParsing -OutFile $Cloudflared -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"\n  }\n}\nif (-not $Python) {\n  if (Get-Command py -ErrorAction SilentlyContinue) { $Python = "py" } else { $Python = "python" }\n}\n\n$log = Join-Path ([IO.Path]::GetTempPath()) "pes2009-cloudflared.log"\nif (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }\n\nfunction Stop-Todo {\n  foreach ($p in @($script:tunnel, $script:server)) {\n    if ($p -and -not $p.HasExited) {\n      if ($env:OS -eq "Windows_NT") { & taskkill.exe /T /F /PID $p.Id | Out-Null }\n      else { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }\n    }\n  }\n}\n\nfunction Leer-Log {\n  try { return [IO.File]::ReadAllText($log) } catch { return "" }\n}\n\nWrite-Host "1/2 Iniciando servidor de salas (se abre en otra ventana)..."\n$serverArgs = @("server/serve.py", "--bind", "127.0.0.1", "--port", "8081", "--web-root", ".",\n                "--wasm-root", "wasm-page/dist/ppsspp-web", "--adhoc-ws")\n$script:server = Start-Process -FilePath $Python -ArgumentList $serverArgs -WorkingDirectory $PSScriptRoot -PassThru\n\nWrite-Host "2/2 Abriendo tunel de Cloudflare..."\n$tunnelArgs = @("tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:27312", "--logfile", $log)\nif ($env:OS -eq "Windows_NT") {\n  $script:tunnel = Start-Process -FilePath $Cloudflared -ArgumentList $tunnelArgs -PassThru -WindowStyle Minimized\n} else {\n  $script:tunnel = Start-Process -FilePath $Cloudflared -ArgumentList $tunnelArgs -PassThru\n}\n\n# Esperar la direccion publica del tunel\n$relay = $null\nfor ($i = 0; $i -lt 60 -and -not $relay; $i++) {\n  Start-Sleep -Seconds 1\n  if ($script:tunnel.HasExited) { break }\n  foreach ($m in [regex]::Matches((Leer-Log), \'https://([a-z0-9-]+\\.trycloudflare\\.com)\')) {\n    if ($m.Groups[1].Value -notmatch \'^api\\.\') { $relay = $m.Groups[1].Value; break }\n  }\n}\nif (-not $relay) {\n  Write-Host ""\n  Write-Host "No se pudo abrir el tunel de Cloudflare. Ultimas lineas del registro:" -ForegroundColor Red\n  (Leer-Log) -split "`n" | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }\n  Stop-Todo\n  if (-not $NoWait) { Read-Host "Presiona Enter para salir" | Out-Null }\n  exit 1\n}\n\n# Esperar a que el tunel quede conectado (unos segundos)\nfor ($i = 0; $i -lt 20; $i++) {\n  if ((Leer-Log) -match \'Registered tunnel connection\') { break }\n  Start-Sleep -Seconds 1\n}\n\n$link = $Pagina + "?relay=" + $relay\ntry { Set-Clipboard -Value $link } catch { }\nWrite-Host ""\nWrite-Host "LISTO. Comparte este link con tu rival (ya esta copiado):" -ForegroundColor Green\nWrite-Host "  $link" -ForegroundColor Yellow\nWrite-Host ""\nWrite-Host "Tu tambien juegas desde ese mismo link. Cada uno carga su propio ISO."\nWrite-Host "Deja esta ventana y la del servidor abiertas mientras juegan."\nif (-not $NoBrowser) { Start-Process $link }\nif (-not $NoWait) { Read-Host "Presiona Enter para cerrar el servidor y el tunel" | Out-Null }\nStop-Todo\n'
+          bat = '@echo off\r\ncd /d "%~dp0"\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0iniciar-online.ps1"\r\npause\r\n'
+          ps1 = ps1.replace('__PAGINA__', os.environ['PAGINA']).replace('\n', '\r\n')
+          open('local/pes2009-local/iniciar-online.ps1', 'w', newline='').write(ps1)
+          open('local/pes2009-local/iniciar-online.bat', 'w', newline='').write(bat)
+          print('iniciar-online.ps1 / .bat creados')
+          EOF
 
       - name: Subir paquete local (descargable en la ejecución)
         uses: actions/upload-artifact@v4
