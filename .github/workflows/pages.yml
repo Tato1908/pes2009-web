@@ -125,6 +125,141 @@ jobs:
           print("Parche de reconexion UDP aplicado")
           EOF
 
+      - name: Parche - MSG_PEEK en WebAssembly (paquetes perdidos)
+        # Emscripten ignora MSG_PEEK en recv/recvfrom y consume el paquete. PPSSPP "mira"
+        # cada paquete antes de leerlo, asi que se perdian casi todos: el rival aparecia
+        # un instante y luego "No hubo comunicacion del rival".
+        run: |
+          python3 - <<'EOF'
+          p = "ppsspp-wasm-src/Core/HLE/sceNetAdhoc.cpp"
+          s = open(p).read()
+          anchor = '#include "ext/aemu_postoffice/client/postoffice_client.h"\n'
+          assert s.count(anchor) == 1, "No se encontro el punto de insercion en sceNetAdhoc.cpp"
+          inc = r'''
+          #ifdef __EMSCRIPTEN__
+          // pes2009-web: Emscripten's recv/recvfrom ignore MSG_PEEK and consume the data.
+          // PPSSPP peeks every adhoc packet before reading it, so without this the real read
+          // gets the NEXT packet (or nothing) and most PDP/PTP traffic is lost.
+          #include <map>
+          #include <vector>
+          #include <cstring>
+          #include <algorithm>
+          namespace {
+          struct WasmPeekEntry {
+          	std::vector<char> data;
+          	sockaddr_storage from;
+          	socklen_t fromlen;
+          };
+          std::map<int, WasmPeekEntry> g_wasmPeek;
+          std::mutex g_wasmPeekLock;
+          }
+
+          static int wasm_recvfrom(int fd, void *buf, size_t len, int flags, sockaddr *from, socklen_t *fromlen) {
+          	std::lock_guard<std::mutex> guard(g_wasmPeekLock);
+          	auto it = g_wasmPeek.find(fd);
+          	if (it == g_wasmPeek.end()) {
+          		if (!(flags & MSG_PEEK))
+          			return (int)::recvfrom(fd, buf, len, flags, from, fromlen);
+          		WasmPeekEntry e;
+          		e.data.resize(65536);
+          		memset(&e.from, 0, sizeof(e.from));
+          		e.fromlen = sizeof(e.from);
+          		int r = (int)::recvfrom(fd, e.data.data(), e.data.size(), flags & ~MSG_PEEK, (sockaddr *)&e.from, &e.fromlen);
+          		if (r < 0)
+          			return r;
+          		e.data.resize(r);
+          		it = g_wasmPeek.emplace(fd, std::move(e)).first;
+          	}
+          	WasmPeekEntry &e = it->second;
+          	size_t n = std::min(len, e.data.size());
+          	if (n)
+          		memcpy(buf, e.data.data(), n);
+          	if (from && fromlen) {
+          		memcpy(from, &e.from, std::min(*fromlen, e.fromlen));
+          		*fromlen = e.fromlen;
+          	}
+          	if (!(flags & MSG_PEEK))
+          		g_wasmPeek.erase(it);  // datagram: the rest of a truncated packet is discarded
+          	return (int)n;
+          }
+
+          static int wasm_recv(int fd, void *buf, size_t len, int flags) {
+          	std::lock_guard<std::mutex> guard(g_wasmPeekLock);
+          	auto it = g_wasmPeek.find(fd);
+          	if (flags & MSG_PEEK) {
+          		if (it == g_wasmPeek.end()) {
+          			WasmPeekEntry e;
+          			e.data.resize(65536);
+          			e.fromlen = 0;
+          			int r = (int)::recv(fd, e.data.data(), e.data.size(), flags & ~MSG_PEEK);
+          			if (r <= 0)
+          				return r;
+          			e.data.resize(r);
+          			it = g_wasmPeek.emplace(fd, std::move(e)).first;
+          		}
+          		size_t n = std::min(len, it->second.data.size());
+          		memcpy(buf, it->second.data.data(), n);
+          		return (int)n;
+          	}
+          	if (it == g_wasmPeek.end())
+          		return (int)::recv(fd, buf, len, flags);
+          	WasmPeekEntry &e = it->second;  // stream: hand out stashed bytes first, keep the rest
+          	size_t n = std::min(len, e.data.size());
+          	memcpy(buf, e.data.data(), n);
+          	e.data.erase(e.data.begin(), e.data.begin() + n);
+          	if (e.data.empty())
+          		g_wasmPeek.erase(it);
+          	return (int)n;
+          }
+
+          static int wasm_closesocket(int fd) {
+          	{
+          		std::lock_guard<std::mutex> guard(g_wasmPeekLock);
+          		g_wasmPeek.erase(fd);
+          	}
+          	return ::close(fd);
+          }
+
+          #define recvfrom(...) wasm_recvfrom(__VA_ARGS__)
+          #define recv(...) wasm_recv(__VA_ARGS__)
+          #undef closesocket
+          #define closesocket(s) wasm_closesocket(s)
+          #endif
+          '''
+          inc = "\n".join(l[10:] if l.startswith(" " * 10) else l for l in inc.splitlines()) + "\n"
+          s = s.replace(anchor, anchor + inc)
+          open(p, "w").write(s)
+          print("Parche MSG_PEEK aplicado")
+          EOF
+
+      - name: Parche - servidor de salas (diagnostico UDP, candado de envio)
+        run: |
+          python3 - <<'EOF'
+          p = "upstream/server/serve.py"
+          s = open(p).read()
+          R = [
+            ('        if target and source_host:\n            target.send_udp(source_host, source_port, payload)\n',
+             '        if target and source_host:\n            target.send_udp(source_host, source_port, payload)\n            reason = "ok"\n        elif not source_host:\n            reason = "origen sin login"\n        elif not dst_mac:\n            reason = "IP destino desconocida"\n        else:\n            reason = "destino sin UDP en ese puerto"\n        _udp_stat(f"{source_host or source_mac}:{source_port} -> {dst_host}:{dst_port}", reason, len(payload))\n'),
+            ('\nclass AdhocUser:',
+             '\n_UDP_STATS = {}\n_UDP_LOCK = threading.Lock()\n\ndef _udp_stat(route, reason, size):\n    with _UDP_LOCK:\n        c = _UDP_STATS.setdefault((route, reason), [0, 0])\n        c[0] += 1\n        c[1] += size\n\ndef _udp_report_loop():\n    while True:\n        time.sleep(3)\n        with _UDP_LOCK:\n            items = sorted(_UDP_STATS.items())\n            _UDP_STATS.clear()\n        for (route, reason), (n, b) in items:\n            print(f"UDP {time.strftime(\'%H:%M:%S\')}: {route}  {n} paq / {b} bytes  [{reason}]", flush=True)\n\n\nclass AdhocUser:'),
+            ('        threading.Thread(target=adhoc_server.serve_forever, name="AdhocWebSocketServer", daemon=True).start()\n',
+             '        threading.Thread(target=adhoc_server.serve_forever, name="AdhocWebSocketServer", daemon=True).start()\n        threading.Thread(target=_udp_report_loop, name="UdpReport", daemon=True).start()\n'),
+            ('        self.user = AdhocUser(self)\n        self.alive = True\n',
+             '        self.user = AdhocUser(self)\n        self.alive = True\n        self.send_lock = threading.Lock()\n        self.opened_at = time.time()\n'),
+            ('            self.request.sendall(self._frame(payload))\n',
+             '            with self.send_lock:\n                self.request.sendall(self._frame(payload))\n'),
+            ('            self.request.sendall(self._frame(payload, opcode=10))\n',
+             '            with self.send_lock:\n                self.request.sendall(self._frame(payload, opcode=10))\n'),
+            ('        finally:\n            self.lobby.unregister_udp(self.udp_mac, self.udp_port, self)\n',
+             '        finally:\n            self.lobby.unregister_udp(self.udp_mac, self.udp_port, self)\n            print(f"Adhoc WS: canal UDP cerrado {self.udp_mac}:{self.udp_port} tras {time.time() - self.opened_at:.1f}s", flush=True)\n'),
+          ]
+          for a, b in R:
+              assert s.count(a) == 1, "serve.py: no se encontro: " + a[:60]
+              s = s.replace(a, b)
+          open(p, "w").write(s)
+          print("Parche de servidor aplicado")
+          EOF
+
       - name: Compilar PPSSPP a WebAssembly (tarda bastante)
         working-directory: upstream
         run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
