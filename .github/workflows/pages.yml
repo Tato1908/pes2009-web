@@ -61,6 +61,31 @@ jobs:
           print("Parche DNS aplicado")
           EOF
 
+      - name: Parche - conexión al lobby ad-hoc
+        # 1) PPSSPP no se conecta si el servidor es 127.0.0.1 (regla de escritorio
+        #    para varias instancias); en el navegador cada pestaña es una PSP aparte.
+        # 2) El puente de red de la página mandaba también la conexión al lobby
+        #    (puerto 27312) por el canal PTP; debe ir directo al lobby.
+        run: |
+          python3 - <<'EOF'
+          p = "ppsspp-wasm-src/Core/HLE/proAdhoc.cpp"
+          s = open(p).read()
+          old = ("\tif (g_adhocServerIP.in.sin_addr.s_addr == g_localhostIP.in.sin_addr.s_addr && !g_Config.bEnableAdhocServer)\n"
+                 "\t\treturn SOCKET_ERROR;\n")
+          assert s.count(old) == 1, "No se encontró el chequeo de localhost en proAdhoc.cpp"
+          open(p, "w").write(s.replace(old, "#ifndef __EMSCRIPTEN__\n" + old + "#endif\n"))
+
+          p = "upstream/wasm-page/public/ppsspp-runtime.js"
+          s = open(p).read()
+          old = ("  ops.connect = function(sock, addr, port) {\n"
+                 "    if (sock.type !== 1 || !loadNetworkConfig().enabled) {\n")
+          new = ("  ops.connect = function(sock, addr, port) {\n"
+                 "    if (sock.type !== 1 || !loadNetworkConfig().enabled || port === ADHOC_WS_PORT) {\n")
+          assert s.count(old) == 1, "No se encontró ops.connect en ppsspp-runtime.js"
+          open(p, "w").write(s.replace(old, new))
+          print("Parches de lobby aplicados")
+          EOF
+
       - name: Compilar PPSSPP a WebAssembly (tarda bastante)
         working-directory: upstream
         run: make wasm-release WASM_ROOT=../ppsspp-wasm-src CMAKE=/usr/bin/cmake WASM_JOBS="-j$(nproc)"
